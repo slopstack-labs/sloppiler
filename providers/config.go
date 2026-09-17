@@ -22,7 +22,7 @@ type Config struct {
 // debugLogf writes a dim diagnostic line to stderr when VerboseDebugLoggingEnabled is true.
 func (providerRuntimeConfig Config) debugLogf(diagnosticMessageFormat string, diagnosticMessageArgs ...any) {
 	if providerRuntimeConfig.VerboseDebugLoggingEnabled {
-		fmt.Fprintf(os.Stderr, "  \033[2m[debug] "+diagnosticMessageFormat+"\033[0m\n", diagnosticMessageArgs...)
+		fmt.Fprintf(os.Stderr, "  "+Dim+"[debug] "+diagnosticMessageFormat+Reset+"\n", diagnosticMessageArgs...)
 	}
 }
 

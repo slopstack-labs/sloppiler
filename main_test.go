@@ -1,6 +1,7 @@
 package main
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -146,6 +147,11 @@ func TestNasmFormat(t *testing.T) {
 // ── linkerArgs (deterministic branches) ───────────────────────────────────────
 
 func TestLinkerArgsAmd64Linux(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// A Windows host has no ELF-capable ld; that combination is rejected up
+		// front and covered by TestHostLinkSupportError instead.
+		t.Skip("ELF linking is not available on a Windows host")
+	}
 	linker, args, err := linkerArgs("linux", "amd64", "x.o", "out")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

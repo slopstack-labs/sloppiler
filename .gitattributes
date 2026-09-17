@@ -1,0 +1,31 @@
+# Normalize line endings so a Windows checkout stays toolchain-clean.
+#
+# With core.autocrlf=true — the Git for Windows default — a checkout rewrites
+# every tracked file to CRLF. gofmt then reports every Go source file as
+# unformatted, so the repository's own CI command (`gofmt -l .`) fails locally
+# on Windows while passing on the Linux runner. Pinning LF in the working tree
+# keeps the Go toolchain, bash, and CI in agreement on every host.
+
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.mod  text eol=lf
+*.sum  text eol=lf
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.html text eol=lf
+*.c    text eol=lf
+*.cpp  text eol=lf
+*.py   text eol=lf
+*.java text eol=lf
+
+# PowerShell is happiest with CRLF, and nothing else reads these files.
+*.ps1 text eol=crlf
+
+*.png  binary
+*.jpg  binary
+*.gif  binary
+*.ico  binary
+*.zip  binary

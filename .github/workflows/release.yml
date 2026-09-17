@@ -85,7 +85,7 @@ jobs:
             *Beyond Deterministic Compilation.*
 
             Download the binary for your platform and point it at a running Ollama instance.
-            Output is always a Linux x86_64 ELF. That's not a bug.
+            Sloppiler now targets your host OS and architecture by default — pass `--target` and `--arch` to materialize something else. Whether the result runs is still not a bug.
 
             | Platform | Binary |
             |----------|--------|

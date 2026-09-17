@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -14,14 +16,25 @@ import (
 
 // ── ANSI colours ─────────────────────────────────────────────────────────────
 
-const (
-	reset  = "\033[0m"
-	bold   = "\033[1m"
-	dim    = "\033[2m"
-	green  = "\033[32m"
-	cyan   = "\033[36m"
-	yellow = "\033[33m"
-	red    = "\033[31m"
+// Sourced from the providers package, which negotiates with the attached
+// terminal at init time and blanks these when escape sequences cannot be
+// rendered — a Windows console without virtual-terminal processing, a
+// redirected stream, or NO_COLOR. Package initialisation order guarantees
+// providers is fully initialised before these are evaluated.
+var (
+	reset  = providers.Reset
+	bold   = providers.Bold
+	dim    = providers.Dim
+	green  = providers.Green
+	cyan   = providers.Cyan
+	yellow = providers.Yellow
+	red    = providers.Red
+
+	glyphOK      = providers.GlyphOK
+	glyphFail    = providers.GlyphFail
+	glyphWarn    = providers.GlyphWarn
+	glyphRetry   = providers.GlyphRetry
+	glyphIterate = providers.GlyphIterate
 )
 
 // ── Prompts ───────────────────────────────────────────────────────────────────
@@ -236,6 +249,10 @@ Hex output (starting with 7f454c46):
 	}
 }
 
+// defaultOutputPath is the output filename used when -o is omitted. For
+// --target=windows it is rewritten to a.exe by resolveOutputPath.
+const defaultOutputPath = "a.out"
+
 // ── Arg reordering ────────────────────────────────────────────────────────────
 
 func reorderArgs(args []string) []string {
@@ -277,13 +294,13 @@ func main() {
 	os.Args = append(os.Args[:1], reorderArgs(os.Args[1:])...)
 
 	model := flag.String("model", "", "Model name (default: provider-specific — llama3 / gpt-4o / gemini-2.0-flash / claude-opus-4-5)")
-	output := flag.String("o", "a.out", "Output binary file")
+	output := flag.String("o", defaultOutputPath, "Output binary file (gains a .exe extension for --target=windows)")
 	ollamaHost := flag.String("ollama", providers.DefaultOllamaURL, "Ollama API URL (only used with --provider=local)")
 	optimistic := flag.Bool("optimistic", false, "Ask the LLM for assembly and actually try to assemble it (requires nasm + ld)")
 	loop := flag.Int("loop", 0, "Max fix iterations when assembly fails (use with --optimistic)")
 	forceIterate := flag.Int("force-iterate", 0, "Force N improvement cycles even when assembly succeeds (use with --optimistic)")
-	target := flag.String("target", "linux", "Target OS for output binary: linux, windows, darwin")
-	arch := flag.String("arch", "amd64", "Target CPU architecture for binary materialization: amd64, arm64")
+	target := flag.String("target", defaultTarget(), "Target OS for output binary: linux, windows, darwin (default: host OS)")
+	arch := flag.String("arch", defaultArch(), "Target CPU architecture for binary materialization: amd64, arm64 (default: host architecture)")
 	providerName := flag.String("provider", "local", "LLM provider to use: local, openai, google, claude")
 	apiKey := flag.String("api-key", "", "API key for the chosen provider (required unless --provider=local; or set SLOPPILER_API_KEY)")
 	timeout := flag.Int("timeout", 300, "HTTP request timeout in seconds per LLM call (0 = no timeout)")
@@ -308,6 +325,17 @@ func main() {
 	default:
 		fatalf("unsupported --arch %q (supported: amd64, arm64)", *arch)
 	}
+
+	// Validate target OS.
+	switch *target {
+	case "linux", "windows", "darwin":
+	default:
+		fatalf("unsupported --target %q (supported: linux, windows, darwin)", *target)
+	}
+
+	// Windows resolves executables by extension — a PE binary written to an
+	// extensionless path cannot be launched from a shell at all.
+	*output = resolveOutputPath(*output, defaultOutputPath, *target)
 
 	// Resolve API key: flag → env var fallback.
 	if *apiKey == "" {
@@ -392,8 +420,8 @@ func main() {
 	if info != nil {
 		size = info.Size()
 	}
-	fmt.Fprintf(os.Stderr, "\n  %s✓%s  %s%s%s  %s%d bytes%s  —  binary deliverable shipped to production.\n\n",
-		green, reset, bold, *output, reset, dim, size, reset)
+	fmt.Fprintf(os.Stderr, "\n  %s%s%s  %s%s%s  %s%d bytes%s  —  binary deliverable shipped to production.\n\n",
+		green, glyphOK, reset, bold, *output, reset, dim, size, reset)
 }
 
 // ── Fake progress ─────────────────────────────────────────────────────────────
@@ -446,30 +474,35 @@ func nasmFormat(target string) string {
 // required assembler is missing.
 func assembleCommand(target, arch, asmFile, objFile string) (string, []string, error) {
 	if arch == "arm64" {
-		if _, err := exec.LookPath("as"); err != nil {
-			return "", nil, fmt.Errorf("as (GNU assembler) not found in PATH — install binutils or the Xcode command line tools for arm64 assembly")
+		assembler, found := lookToolPath("as", "aarch64-linux-gnu-as", "llvm-as")
+		if !found {
+			return "", nil, missingToolError("as (GNU assembler)", "as")
 		}
 		if target == "darwin" {
-			return "as", []string{"-arch", "arm64", asmFile, "-o", objFile}, nil
+			return assembler, []string{"-arch", "arm64", asmFile, "-o", objFile}, nil
 		}
-		return "as", []string{asmFile, "-o", objFile}, nil
+		return assembler, []string{asmFile, "-o", objFile}, nil
 	}
 	if _, err := exec.LookPath("nasm"); err != nil {
-		return "", nil, fmt.Errorf("nasm not found in PATH — install it first (e.g. sudo pacman -S nasm)")
+		return "", nil, missingToolError("nasm", "nasm")
 	}
 	return "nasm", []string{"-f", nasmFormat(target), asmFile, "-o", objFile}, nil
 }
 
 // windowsImportLibDir ensures kernel32/msvcrt import libraries exist and returns the dir.
 func windowsImportLibDir() (string, error) {
-	libDir := "/tmp/sloppiler-win-libs"
+	// os.TempDir resolves to %TEMP% on Windows and /tmp elsewhere; hardcoding
+	// "/tmp" produced a stray E:\tmp directory on a Windows host.
+	libDir := filepath.Join(os.TempDir(), "sloppiler-win-libs")
 	if err := os.MkdirAll(libDir, 0755); err != nil {
 		return "", err
 	}
 
-	dlltool := "x86_64-w64-mingw32-dlltool"
-	if _, err := exec.LookPath(dlltool); err != nil {
-		return "", fmt.Errorf("%s not found — install mingw-w64-binutils", dlltool)
+	// A cross toolchain prefixes its binaries; a native Windows MinGW-w64 or
+	// MSYS2 install exposes them bare.
+	dlltool, found := lookToolPath("x86_64-w64-mingw32-dlltool", "dlltool")
+	if !found {
+		return "", missingToolError("dlltool", "mingw")
 	}
 
 	type lib struct {
@@ -524,11 +557,11 @@ EXPORTS
 	}
 
 	for _, l := range libs {
-		libPath := libDir + "/lib" + l.name + ".a"
+		libPath := filepath.Join(libDir, "lib"+l.name+".a")
 		if _, err := os.Stat(libPath); err == nil {
 			continue // already built
 		}
-		defFile := libDir + "/" + l.name + ".def"
+		defFile := filepath.Join(libDir, l.name+".def")
 		if err := os.WriteFile(defFile, []byte(l.def), 0644); err != nil {
 			return "", err
 		}
@@ -547,6 +580,9 @@ EXPORTS
 // macOS arm64 ABI requires dynamic linking against libSystem plus code signing,
 // which the static assemble-and-link pipeline cannot provide.
 func linkerArgs(target, arch, objFile, outputPath string) (string, []string, error) {
+	if err := hostLinkSupportError(runtime.GOOS, target); err != nil {
+		return "", nil, err
+	}
 	if arch == "arm64" {
 		switch target {
 		case "darwin":
@@ -562,27 +598,39 @@ func linkerArgs(target, arch, objFile, outputPath string) (string, []string, err
 					return linker, []string{"-m", "aarch64linux", objFile, "-o", outputPath}, nil
 				}
 			}
-			return "", nil, fmt.Errorf("no arm64-capable linker found — install binutils (e.g. aarch64-linux-gnu-ld) or lld")
+			return "", nil, missingToolError("an arm64-capable linker", "binutils-arm64")
 		}
 	}
 	switch target {
 	case "windows":
-		linker := "x86_64-w64-mingw32-ld"
-		if _, err := exec.LookPath(linker); err != nil {
-			return "", nil, fmt.Errorf("%s not found — install mingw-w64 (e.g. sudo pacman -S mingw-w64-binutils)", linker)
+		// Preference order: the GNU linker (cross-prefixed, or bare on a native
+		// MinGW-w64/MSYS2 Windows install), then the MSVC-style linkers that a
+		// Windows developer already has from the Visual Studio Build Tools or
+		// LLVM. The bare "ld" candidate is only safe here because a PE-native
+		// binutils is the only ld that exists on a Windows host — the
+		// hostLinkSupportError guard above keeps this branch honest.
+		gnuLinkerCandidates := append([]string{"x86_64-w64-mingw32-ld"}, windowsNativeGNULinkerCandidates()...)
+		if linker, found := lookToolPath(gnuLinkerCandidates...); found {
+			libDir, err := windowsImportLibDir()
+			if err != nil {
+				return "", nil, fmt.Errorf("cannot build Windows import libs: %w", err)
+			}
+			args := []string{
+				"--entry", "_start", "--subsystem", "console",
+				"--disable-runtime-pseudo-reloc",
+				objFile,
+				"-L", libDir, "-lkernel32", "-lmsvcrt",
+				"-o", outputPath,
+			}
+			return linker, args, nil
 		}
-		libDir, err := windowsImportLibDir()
-		if err != nil {
-			return "", nil, fmt.Errorf("cannot build Windows import libs: %w", err)
+		if linker, found := lookToolPath("lld-link", "link"); found {
+			// MSVC-style linkers consume kernel32.lib straight from the Windows
+			// SDK, so no import library synthesis is needed. %LIB% must be set,
+			// which a Developer PowerShell does for you.
+			return linker, msvcLinkerArgs(objFile, outputPath), nil
 		}
-		args := []string{
-			"--entry", "_start", "--subsystem", "console",
-			"--disable-runtime-pseudo-reloc",
-			objFile,
-			"-L", libDir, "-lkernel32", "-lmsvcrt",
-			"-o", outputPath,
-		}
-		return linker, args, nil
+		return "", nil, missingToolError("no Windows-capable linker (ld / lld-link / link)", windowsLinkerGuidanceComponent())
 	case "darwin":
 		for _, linker := range []string{"ld64.lld", "ld.lld"} {
 			if _, err := exec.LookPath(linker); err == nil {
@@ -590,14 +638,18 @@ func linkerArgs(target, arch, objFile, outputPath string) (string, []string, err
 				return linker, args, nil
 			}
 		}
-		return "", nil, fmt.Errorf("no macOS-capable linker found — install lld (e.g. sudo pacman -S lld)")
+		return "", nil, missingToolError("no macOS-capable linker", "lld")
 	default:
 		return "ld", []string{"-m", "elf_x86_64", objFile, "-o", outputPath}, nil
 	}
 }
 
 func optimisticCompile(source string, prov providers.Provider, outputPath, target, arch string, maxLoop, forceIterate int) ([]byte, error) {
-	// Fail fast on unsupported arm64 target combinations before spending an LLM call.
+	// Fail fast on host/target combinations that cannot link, before spending an
+	// LLM call on assembly that has nowhere to go.
+	if err := hostLinkSupportError(runtime.GOOS, target); err != nil {
+		return nil, err
+	}
 	if arch == "arm64" {
 		if _, _, err := linkerArgs(target, arch, "probe.o", outputPath); err != nil {
 			return nil, err
@@ -642,7 +694,7 @@ func optimisticCompile(source string, prov providers.Provider, outputPath, targe
 				fmt.Fprintf(os.Stderr, "  %sassembly:%s\n%s\n", dim, reset, indent(asm, "    "))
 				return nil, fmt.Errorf("%s failed after %d attempt(s)", assemblerLabel, attempt+1)
 			}
-			fmt.Fprintf(os.Stderr, "  %s↻%s  loop %d/%d — re-aligning LLM outputs with ground truth\n\n", yellow, reset, attempt+1, maxLoop)
+			fmt.Fprintf(os.Stderr, "  %s%s%s  loop %d/%d — re-aligning LLM outputs with ground truth\n\n", yellow, glyphRetry, reset, attempt+1, maxLoop)
 			asm, err = prov.Stream(fixPromptFor(target, arch, string(nasmOut), asm),
 				[]string{fmt.Sprintf("fixing assembly (attempt %d/%d)", attempt+1, maxLoop)})
 			if err != nil {
@@ -672,7 +724,7 @@ func optimisticCompile(source string, prov providers.Provider, outputPath, targe
 
 		if forceIterate > 0 {
 			forceIterate--
-			fmt.Fprintf(os.Stderr, "  %s⟳%s  force-iterate — proactively enhancing output quality (%d remaining)\n\n", cyan, reset, forceIterate)
+			fmt.Fprintf(os.Stderr, "  %s%s%s  force-iterate — proactively enhancing output quality (%d remaining)\n\n", cyan, glyphIterate, reset, forceIterate)
 			asm, err = prov.Stream(improvePromptFor(target, arch, asm),
 				[]string{fmt.Sprintf("enhancing assembly (%d remaining)", forceIterate)})
 			if err != nil {
@@ -698,7 +750,7 @@ func slopCompile(source string, prov providers.Provider, target, arch string, pr
 	wrap := wrapperFor(target, arch)
 
 	if len(hexStr) < 8 {
-		fmt.Fprintf(os.Stderr, "  %s⚠%s  model output deviates from expected schema — applying fallback remediation\n", yellow, reset)
+		fmt.Fprintf(os.Stderr, "  %s%s%s  model output deviates from expected schema — applying fallback remediation\n", yellow, glyphWarn, reset)
 		return wrap([]byte(raw)), nil
 	}
 
@@ -714,7 +766,7 @@ func slopCompile(source string, prov providers.Provider, target, arch string, pr
 
 	payload, err := hex.DecodeString(hexStr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  %s⚠%s  binary deserialization encountered a non-blocking anomaly (%v) — initiating graceful degradation\n", yellow, reset, err)
+		fmt.Fprintf(os.Stderr, "  %s%s%s  binary deserialization encountered a non-blocking anomaly (%v) — initiating graceful degradation\n", yellow, glyphWarn, reset, err)
 		return wrap([]byte(raw)), nil
 	}
 
@@ -1050,6 +1102,6 @@ func indent(s, prefix string) string {
 }
 
 func fatalf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "\n  %s✗%s  "+format+"\n\n", append([]any{red, reset}, args...)...)
+	fmt.Fprintf(os.Stderr, "\n  %s%s%s  "+format+"\n\n", append([]any{red, glyphFail, reset}, args...)...)
 	os.Exit(1)
 }

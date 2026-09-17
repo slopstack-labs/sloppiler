@@ -7,20 +7,13 @@ import (
 	"time"
 )
 
-// ANSI escape sequences used internally by the spinner.
-const (
-	spinReset = "\033[0m"
-	spinDim   = "\033[2m"
-	spinGreen = "\033[32m"
-	spinCyan  = "\033[36m"
-	spinRed   = "\033[31m"
-	spinClrLn = "\r\033[K"
-)
-
-var brailleAnimationFrameSequence = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-
-// Spinner shows a live braille-animated progress indicator on stderr.
+// Spinner shows a live animated progress indicator on stderr.
 // It is safe to call OK or Fail exactly once after starting.
+//
+// When the attached stream cannot render ANSI escape sequences — a redirected
+// run, NO_COLOR, or a Windows console that refused virtual-terminal processing —
+// the animation is suppressed entirely and each step settles into a single
+// static line instead of scrolling thousands of redraws into a log file.
 type Spinner struct {
 	progressLabel                string
 	accumulatedInferenceTokens   atomic.Int64
@@ -35,6 +28,14 @@ func StartSpinner(progressLabel string) *Spinner {
 		terminationSignalChannel:     make(chan struct{}),
 		completionAcknowledgeChannel: make(chan struct{}),
 	}
+	if !animationsEnabled {
+		// Keep the channel contract identical so OK and Fail stay unchanged.
+		go func() {
+			defer close(spinnerProgressIndicatorInstance.completionAcknowledgeChannel)
+			<-spinnerProgressIndicatorInstance.terminationSignalChannel
+		}()
+		return spinnerProgressIndicatorInstance
+	}
 	go func() {
 		defer close(spinnerProgressIndicatorInstance.completionAcknowledgeChannel)
 		for iterationIndexVector := 0; ; iterationIndexVector++ {
@@ -45,15 +46,15 @@ func StartSpinner(progressLabel string) *Spinner {
 				accumulatedTokenCount := spinnerProgressIndicatorInstance.accumulatedInferenceTokens.Load()
 				if accumulatedTokenCount > 0 {
 					fmt.Fprintf(os.Stderr, "%s  %s%s%s  %s  %s%d tokens%s",
-						spinClrLn, spinCyan,
-						brailleAnimationFrameSequence[iterationIndexVector%len(brailleAnimationFrameSequence)],
-						spinReset, spinnerProgressIndicatorInstance.progressLabel,
-						spinDim, accumulatedTokenCount, spinReset)
+						ClearLine, Cyan,
+						spinnerAnimationFrames[iterationIndexVector%len(spinnerAnimationFrames)],
+						Reset, spinnerProgressIndicatorInstance.progressLabel,
+						Dim, accumulatedTokenCount, Reset)
 				} else {
 					fmt.Fprintf(os.Stderr, "%s  %s%s%s  %s",
-						spinClrLn, spinCyan,
-						brailleAnimationFrameSequence[iterationIndexVector%len(brailleAnimationFrameSequence)],
-						spinReset, spinnerProgressIndicatorInstance.progressLabel)
+						ClearLine, Cyan,
+						spinnerAnimationFrames[iterationIndexVector%len(spinnerAnimationFrames)],
+						Reset, spinnerProgressIndicatorInstance.progressLabel)
 				}
 				time.Sleep(80 * time.Millisecond)
 			}
@@ -72,25 +73,25 @@ func (spinnerProgressIndicatorContext *Spinner) SetTokens(absoluteTokenCount int
 	spinnerProgressIndicatorContext.accumulatedInferenceTokens.Store(absoluteTokenCount)
 }
 
-// OK stops the spinner and prints a green ✓.
+// OK stops the spinner and prints a green success marker.
 func (spinnerProgressIndicatorContext *Spinner) OK() {
 	close(spinnerProgressIndicatorContext.terminationSignalChannel)
 	<-spinnerProgressIndicatorContext.completionAcknowledgeChannel
 	accumulatedTokenCount := spinnerProgressIndicatorContext.accumulatedInferenceTokens.Load()
 	if accumulatedTokenCount > 0 {
-		fmt.Fprintf(os.Stderr, "%s  %s✓%s  %s  %s(%d tokens)%s\n",
-			spinClrLn, spinGreen, spinReset, spinnerProgressIndicatorContext.progressLabel,
-			spinDim, accumulatedTokenCount, spinReset)
+		fmt.Fprintf(os.Stderr, "%s  %s%s%s  %s  %s(%d tokens)%s\n",
+			ClearLine, Green, GlyphOK, Reset, spinnerProgressIndicatorContext.progressLabel,
+			Dim, accumulatedTokenCount, Reset)
 	} else {
-		fmt.Fprintf(os.Stderr, "%s  %s✓%s  %s\n",
-			spinClrLn, spinGreen, spinReset, spinnerProgressIndicatorContext.progressLabel)
+		fmt.Fprintf(os.Stderr, "%s  %s%s%s  %s\n",
+			ClearLine, Green, GlyphOK, Reset, spinnerProgressIndicatorContext.progressLabel)
 	}
 }
 
-// Fail stops the spinner and prints a red ✗.
+// Fail stops the spinner and prints a red failure marker.
 func (spinnerProgressIndicatorContext *Spinner) Fail() {
 	close(spinnerProgressIndicatorContext.terminationSignalChannel)
 	<-spinnerProgressIndicatorContext.completionAcknowledgeChannel
-	fmt.Fprintf(os.Stderr, "%s  %s✗%s  %s\n",
-		spinClrLn, spinRed, spinReset, spinnerProgressIndicatorContext.progressLabel)
+	fmt.Fprintf(os.Stderr, "%s  %s%s%s  %s\n",
+		ClearLine, Red, GlyphFail, Reset, spinnerProgressIndicatorContext.progressLabel)
 }
